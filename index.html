@@ -151,6 +151,8 @@ input[type=file]{font:inherit; font-size:.9rem; color:var(--ink-soft); max-width
 .card-row{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) 5.5rem auto; gap:.25rem 1rem; align-items:start; padding:.7rem 0; border-bottom:1px solid var(--rule-blue)}
 .cr-f,.cr-b{font-family:var(--serif); overflow-wrap:anywhere; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; white-space:pre-line}
 .cr-b{color:var(--ink-soft)}
+.cr-fw{min-width:0}
+.cr-c{display:block; font-size:.75rem; color:var(--ink-soft); margin-bottom:.1rem}
 .cr-s{font-size:.82rem; color:var(--ink-soft); padding-top:.15rem}
 .cr-s.n{color:var(--cn)} .cr-s.l{color:var(--cl)} .cr-s.r{color:var(--cr)}
 .cr-a{display:flex; gap:.25rem; justify-content:flex-end}
@@ -168,7 +170,7 @@ input[type=file]{font:inherit; font-size:.9rem; color:var(--ink-soft); max-width
 @media (max-width:40rem){
   .add-grid,.preview{grid-template-columns:1fr}
   .card-row{grid-template-columns:minmax(0,1fr) auto; grid-template-areas:"f f" "b b" "s a"}
-  .cr-f{grid-area:f} .cr-b{grid-area:b} .cr-s{grid-area:s; align-self:center} .cr-a{grid-area:a}
+  .cr-fw{grid-area:f} .cr-b{grid-area:b} .cr-s{grid-area:s; align-self:center} .cr-a{grid-area:a}
   .settings{grid-template-columns:1fr}
 }
 
@@ -418,12 +420,13 @@ function pickNext(deck, now, s) {
 }
 
 /* ---------- Modèle ---------- */
-function newCard(front, back, created) {
-  return { id: newId('c'), front, back, state: 'new', due: 0, ivl: 0, ease: S.startEase, step: 0, reps: 0, lapses: 0, created, b: 0 };
+function newCard(front, back, created, key = '', chap = '') {
+  return { id: newId('c'), front, back, key, chap, state: 'new', due: 0, ivl: 0, ease: S.startEase, step: 0, reps: 0, lapses: 0, created, b: 0 };
 }
 function normCard(c) {
   return {
     id: c.id || newId('c'), front: String(c.front ?? ''), back: String(c.back ?? ''),
+    key: c.key ? String(c.key).trim().slice(0, 120) : '', chap: c.chap ? String(c.chap).trim().slice(0, 120) : '',
     state: ['new', 'learning', 'review', 'relearning'].includes(c.state) ? c.state : 'new',
     due: +c.due || 0, ivl: +c.ivl || 0, ease: +c.ease || S.startEase, step: +c.step || 0,
     reps: +c.reps || 0, lapses: +c.lapses || 0, created: +c.created || Date.now(), b: +c.b || 0
@@ -455,7 +458,7 @@ function setStatus(st) {
 
 const Store = (() => {
   const LS = 'bristol:v1';
-  let mode = 'memory', col = null, timer = null, busy = false, again = false, halted = false;
+  let mode = 'memory', col = null, inbox = null, timer = null, busy = false, again = false, halted = false, lastFailed = false;
   const dirty = new Map(), known = new Map();
 
   const lsOk = () => { try { localStorage.setItem('bristol:t', '1'); localStorage.removeItem('bristol:t'); return true; } catch { return false; } };
@@ -469,7 +472,10 @@ const Store = (() => {
       if (window.claude && typeof window.claude.use === 'function') {
         const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
         const uid = user ? await user.id() : null;
-        if (db && uid) { col = db.doc('data/users/' + uid + '/profile').collection('decks'); mode = 'db'; return mode; }
+        if (db && uid) {
+          const prof = db.doc('data/users/' + uid + '/profile');
+          col = prof.collection('decks'); inbox = prof.collection('inbox'); mode = 'db'; return mode;
+        }
       }
     } catch (e) { /* on bascule sur le stockage local */ }
     mode = lsOk() ? 'local' : 'memory';
@@ -588,8 +594,10 @@ const Store = (() => {
           current = null;
         }
       }
+      lastFailed = false;
       setStatus('saved');
     } catch (err) {
+      lastFailed = true;
       if (current) mergeBack(current[0], current[1]);
       fail(err);
     } finally {
@@ -598,7 +606,38 @@ const Store = (() => {
     }
   }
 
-  return { init, load, touch, flush, mode: () => mode, pending: () => dirty.size > 0 };
+  // Attend que toutes les modifications soient écrites ; false en cas d'échec.
+  async function settle() {
+    for (let i = 0; i < 60; i++) {
+      if (halted) return false;
+      if (busy) { await sleep(150); continue; }
+      if (!dirty.size) return !lastFailed;
+      await flush();
+      if (lastFailed) return false;
+    }
+    return false;
+  }
+
+  // Boîte de réception : des lots de cartes déposés par Claude, fusionnés ici
+  // dans les paquets, puis retirés une fois enregistrés.
+  function watchInbox(apply) {
+    if (mode !== 'db' || !inbox) return;
+    const seen = new Set();
+    let chain = Promise.resolve();
+    inbox.onSnapshot(snap => {
+      for (const doc of snap.docs) {
+        if (seen.has(doc.id)) continue;
+        seen.add(doc.id);
+        const body = clone(doc.data() || {});
+        chain = chain.then(async () => {
+          try { apply(body); } catch (e) { return; }
+          if (await settle()) { try { await retry(() => inbox.doc(doc.id).delete()); } catch { /* sera retraité au prochain chargement */ } }
+        });
+      }
+    }, () => { /* la boîte de réception reste inactive pour cette visite */ });
+  }
+
+  return { init, load, touch, flush, settle, watchInbox, mode: () => mode, pending: () => dirty.size > 0 };
 })();
 
 /* ---------- Mise en forme des cartes ---------- */
@@ -686,6 +725,73 @@ function createDeck(name, color) {
   App.decks.push(d);
   Store.touch(d.id, { all: true, soon: true });
   return d;
+}
+
+// Fusionne des cartes dans un paquet. Une carte avec une clé déjà connue est
+// mise à jour (sa progression est conservée) ; del: true la supprime.
+function mergeItems(deck, items) {
+  const byKey = new Map(deck.cards.filter(c => c.key).map(c => [c.key, c]));
+  const byContent = new Map(deck.cards.map(c => [c.front + '\u0001' + c.back, c]));
+  const now = Date.now(), toAdd = [], removeIds = new Set();
+  let updated = 0, removed = 0, dup = 0;
+  items.forEach((it, i) => {
+    if (!it || typeof it !== 'object') return;
+    const key = String(it.key || '').trim().slice(0, 120), chap = String(it.chap || '').trim().slice(0, 120);
+    const ex = key ? byKey.get(key) : null;
+    if (it.del) { if (ex && !removeIds.has(ex.id)) { removeIds.add(ex.id); removed++; } return; }
+    const front = String(it.front || '').trim().slice(0, MAX_FIELD), back = String(it.back || '').trim().slice(0, MAX_FIELD);
+    if (!front || !back) return;
+    if (ex) {
+      if (ex.front !== front || ex.back !== back || ex.chap !== chap) {
+        ex.front = front; ex.back = back; ex.chap = chap;
+        Store.touch(deck.id, { bucket: ex.b, meta: true }); updated++;
+      }
+      return;
+    }
+    const same = byContent.get(front + '\u0001' + back);
+    if (same) {
+      if (key && !same.key) { same.key = key; same.chap = chap; byKey.set(key, same); Store.touch(deck.id, { bucket: same.b, meta: true }); }
+      else dup++;
+      return;
+    }
+    const c = newCard(front, back, now + i, key, chap);
+    toAdd.push(c); byContent.set(front + '\u0001' + back, c); if (key) byKey.set(key, c);
+  });
+  if (removeIds.size) {
+    const bs = new Set();
+    deck.cards = deck.cards.filter(c => { if (removeIds.has(c.id)) { bs.add(c.b); return false; } return true; });
+    bs.forEach(b => Store.touch(deck.id, { bucket: b, meta: true }));
+  }
+  if (toAdd.length) addCards(deck, toAdd);
+  return { added: toAdd.length, updated, removed, dup };
+}
+function mergeSummary(r) {
+  const parts = [];
+  if (r.added) parts.push(pl(r.added, 'carte ajoutée', 'cartes ajoutées'));
+  if (r.updated) parts.push(pl(r.updated, 'mise à jour', 'mises à jour'));
+  if (r.removed) parts.push(pl(r.removed, 'supprimée', 'supprimées'));
+  if (r.dup) parts.push(pl(r.dup, 'doublon ignoré', 'doublons ignorés'));
+  return parts.length ? parts.join(', ') : 'aucun changement';
+}
+function applyBatch(body) {
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return;
+  const name = String(body.deck || 'Nouvelles cartes').trim().slice(0, 80) || 'Nouvelles cartes';
+  let d = (body.deckId && getDeck(body.deckId)) || App.decks.find(x => norm(x.name.trim()) === norm(name));
+  if (!d) d = createDeck(name, PALETTE.some(p => p.c === body.color) ? body.color : undefined);
+  const r = mergeItems(d, items);
+  Store.touch(d.id, { meta: true, soon: true });
+  refreshAfterExternal(d);
+  toast(`${d.name} : ${mergeSummary(r)}`);
+}
+function refreshAfterExternal(d) {
+  if (App.view === 'home') renderHome();
+  else if (App.view === 'deck' && App.deckId === d.id) { renderDeckSummary(); renderCardList(); }
+  else if (App.view === 'study' && App.s && App.s.deckId === d.id) {
+    const s = App.s;
+    if (!s.current || !d.cards.includes(s.current)) nextCard();
+    else { updateStudyCounts(d, Date.now(), s.kind); if (s.current) paintFaces(d, s.current, s.kind); }
+  }
 }
 
 const SAMPLE = [
@@ -839,7 +945,7 @@ function renderDeckSummary() {
 function renderCardList() {
   const d = getDeck(App.deckId), el = $('#cardList'); if (!d || !el) return;
   const now = Date.now(), q = norm(App.search.trim());
-  const list = [...d.cards].reverse().filter(c => !q || norm(c.front).includes(q) || norm(c.back).includes(q));
+  const list = [...d.cards].reverse().filter(c => !q || norm(c.front).includes(q) || norm(c.back).includes(q) || norm(c.chap).includes(q));
   if (!list.length) {
     el.innerHTML = `<li class="list-empty">${d.cards.length ? `Aucune carte ne contient « ${esc(App.search.trim())} ».` : 'Ce paquet est vide. Ajoute une carte ci-dessus ou importe une liste.'}</li>`;
     return;
@@ -848,7 +954,7 @@ function renderCardList() {
   el.innerHTML = shown.map(c => {
     const st = statusOf(c, now);
     return `<li class="card-row">
-      <div class="cr-f">${esc(c.front)}</div>
+      <div class="cr-fw">${c.chap ? `<span class="cr-c">${esc(c.chap)}</span>` : ''}<div class="cr-f">${esc(c.front)}</div></div>
       <div class="cr-b">${esc(c.back)}</div>
       <span class="cr-s ${st.k}">${st.t}</span>
       <span class="cr-a"><button class="btn quiet sm" data-act="edit-card" data-id="${c.id}">Modifier</button><button class="btn quiet sm danger" data-act="del-card" data-id="${c.id}">Supprimer</button></span>
@@ -994,10 +1100,11 @@ function htmlToText(s) {
 function parseImport(text) {
   text = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const lines = text.split('\n');
-  let sep = null, i = 0;
+  let sep = null, i = 0, ext = false;
   for (; i < lines.length; i++) {
     const m = lines[i].match(/^#([a-z ]+):(.*)$/i);
     if (!m) break;
+    if (m[1].trim().toLowerCase() === 'bristol') ext = true;
     if (m[1].trim().toLowerCase() === 'separator') {
       const v = m[2].trim().toLowerCase();
       sep = { tab: '\t', semicolon: ';', comma: ',', pipe: '|', space: ' ', colon: ':' }[v] || (v.length === 1 ? v : null);
@@ -1005,20 +1112,26 @@ function parseImport(text) {
   }
   const body = lines.slice(i).join('\n');
   if (!sep) sep = detectSep(body);
-  if (!sep || !body.trim()) return { cards: [], sep, skipped: 0 };
+  if (!sep || !body.trim()) return { cards: [], sep, skipped: 0, ext };
   const cards = []; let skipped = 0;
   for (const r of parseDelimited(body, sep)) {
     if (r.length === 1 && !r[0].trim()) continue;
     if (r.length < 2) { skipped++; continue; }
     const front = htmlToText(r[0]).trim().slice(0, MAX_FIELD);
     const back = htmlToText(sep === '\t' ? r[1] : r.slice(1).join(sep)).trim().slice(0, MAX_FIELD);
-    if (front && back) cards.push([front, back]); else skipped++;
+    if (!front || !back) { skipped++; continue; }
+    // Format Bristol : colonnes 3 et 4 = identifiant de la carte et chapitre.
+    const key = ext && sep === '\t' ? String(r[2] || '').trim() : '';
+    const chap = ext && sep === '\t' ? String(r[3] || '').trim() : '';
+    cards.push({ front, back, key, chap });
   }
-  return { cards, sep, skipped };
+  return { cards, sep, skipped, ext };
 }
 function exportText(deck) {
   const q = f => /[\t\n"]/.test(f) ? '"' + f.replace(/"/g, '""') + '"' : f;
-  return '#separator:tab\n#html:false\n' + deck.cards.map(c => q(c.front) + '\t' + q(c.back)).join('\n') + '\n';
+  const ext = deck.cards.some(c => c.key || c.chap);
+  return '#separator:tab\n#html:false\n' + (ext ? '#bristol:1\n' : '') +
+    deck.cards.map(c => q(c.front) + '\t' + q(c.back) + (ext ? '\t' + q(c.key) + '\t' + q(c.chap) : '')).join('\n') + '\n';
 }
 
 function openImport(presetId) {
@@ -1040,8 +1153,8 @@ function openImport(presetId) {
     const n = parsed.cards.length, st = $('#iStatus');
     if (!ta.value.trim()) st.textContent = 'Colle du texte ou choisis un fichier.';
     else if (!n) st.textContent = 'Aucune carte détectée : chaque ligne doit contenir un recto et un verso séparés par une tabulation, un point-virgule ou une barre verticale.';
-    else st.textContent = `${pl(n, 'carte détectée', 'cartes détectées')}, séparateur : ${SEP_NAMES[parsed.sep] || '« ' + parsed.sep + ' »'}.` + (parsed.skipped ? ` ${pl(parsed.skipped, 'ligne ignorée', 'lignes ignorées')} faute de verso.` : '');
-    $('#iPrev').innerHTML = parsed.cards.slice(0, 3).map(([f, b]) => `<li><span>${esc(f)}</span><span>${esc(b)}</span></li>`).join('');
+    else st.textContent = `${pl(n, 'carte détectée', 'cartes détectées')}, séparateur : ${SEP_NAMES[parsed.sep] || '« ' + parsed.sep + ' »'}.` + (parsed.skipped ? ` ${pl(parsed.skipped, 'ligne ignorée', 'lignes ignorées')} faute de verso.` : '') + (parsed.ext ? ' Les cartes déjà présentes seront mises à jour, sans perdre ta progression.' : '');
+    $('#iPrev').innerHTML = parsed.cards.slice(0, 3).map(c => `<li><span>${esc(c.front)}</span><span>${esc(c.back)}</span></li>`).join('');
     go_.disabled = !n;
     go_.textContent = n ? `Importer ${pl(n, 'carte')}` : 'Importer';
   };
@@ -1059,14 +1172,11 @@ function openImport(presetId) {
     if (!parsed.cards.length) return;
     const d = sel.value === '__new' ? createDeck(nameIn.value.trim() || 'Cartes importées') : getDeck(sel.value);
     if (!d) return;
-    const seen = new Set(d.cards.map(c => c.front + '\u0001' + c.back));
-    const now = Date.now(); let dup = 0; const list = [];
-    parsed.cards.forEach(([f, b], i) => { const k = f + '\u0001' + b; if (seen.has(k)) { dup++; return; } seen.add(k); list.push(newCard(f, b, now + i)); });
-    addCards(d, list);
+    const r = mergeItems(d, parsed.cards);
     Store.touch(d.id, { meta: true, soon: true });
     dlg.close();
     go('deck', d.id);
-    toast(`${pl(list.length, 'carte importée', 'cartes importées')}` + (dup ? `, ${pl(dup, 'doublon ignoré', 'doublons ignorés')}` : ''));
+    toast(`Import terminé : ${mergeSummary(r)}`);
   });
 }
 
@@ -1172,7 +1282,7 @@ function setFaces(flipped) {
   f.inert = flipped; b.inert = !flipped;
 }
 function paintFaces(d, card, kind) {
-  $('#ffDeck').textContent = d.name;
+  $('#ffDeck').textContent = card.chap || d.name;
   $('#ffKind').textContent = { n: 'Nouvelle', l: 'En cours', r: 'À revoir' }[kind] || '';
   paintRich($('#ffBody'), card.front);
   paintRich($('#fbQ'), card.front);
@@ -1334,6 +1444,7 @@ async function boot() {
   }
   setStatus(mode === 'memory' ? 'memory' : 'saved');
   go('home');
+  Store.watchInbox(applyBatch);
 }
 boot();
 })();
