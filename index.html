@@ -427,6 +427,7 @@ function normCard(c) {
   return {
     id: c.id || newId('c'), front: String(c.front ?? ''), back: String(c.back ?? ''),
     key: c.key ? String(c.key).trim().slice(0, 120) : '', chap: c.chap ? String(c.chap).trim().slice(0, 120) : '',
+    src: c.src ? String(c.src).slice(0, 120) : '',
     state: ['new', 'learning', 'review', 'relearning'].includes(c.state) ? c.state : 'new',
     due: +c.due || 0, ivl: +c.ivl || 0, ease: +c.ease || S.startEase, step: +c.step || 0,
     reps: +c.reps || 0, lapses: +c.lapses || 0, created: +c.created || Date.now(), b: +c.b || 0
@@ -437,7 +438,7 @@ function normDeck(d) {
   const cards = (d.cards || []).map(normCard).sort((a, b) => a.created - b.created);
   const npd = d.settings && Number.isFinite(+d.settings.newPerDay) ? +d.settings.newPerDay : 20;
   return {
-    id: d.id, name: d.name || 'Sans titre', created: +d.created || Date.now(), color: d.color || PALETTE[0].c,
+    id: d.id, name: d.name || 'Sans titre', created: +d.created || Date.now(), color: d.color || PALETTE[0].c, src: d.src ? String(d.src) : '',
     settings: { newPerDay: npd }, today: d.today && typeof d.today === 'object' ? { day: +d.today.day || 0, newSeen: +d.today.newSeen || 0, reviews: +d.today.reviews || 0 } : { day: 0, newSeen: 0, reviews: 0 },
     cards
   };
@@ -518,7 +519,7 @@ const Store = (() => {
 
   const groupBuckets = deck => { const g = new Map(); for (const c of deck.cards) { if (!g.has(c.b)) g.set(c.b, []); g.get(c.b).push(c); } return g; };
   const stripB = ({ b, ...rest }) => rest;
-  const metaOf = d => ({ v: 1, name: d.name, created: d.created, color: d.color, settings: d.settings, today: d.today });
+  const metaOf = d => ({ v: 1, name: d.name, created: d.created, color: d.color, src: d.src || '', settings: d.settings, today: d.today });
 
   // Un document est limité à 256 Kio : les cartes sont réparties en blocs.
   function rebalance(groups, e) {
@@ -729,7 +730,8 @@ function createDeck(name, color) {
 
 // Fusionne des cartes dans un paquet. Une carte avec une clé déjà connue est
 // mise à jour (sa progression est conservée) ; del: true la supprime.
-function mergeItems(deck, items) {
+function mergeItems(deck, items, opt = {}) {
+  const src = opt.src || '', seenKeys = new Set();
   const byKey = new Map(deck.cards.filter(c => c.key).map(c => [c.key, c]));
   const byContent = new Map(deck.cards.map(c => [c.front + '\u0001' + c.back, c]));
   const now = Date.now(), toAdd = [], removeIds = new Set();
@@ -739,6 +741,7 @@ function mergeItems(deck, items) {
     const key = String(it.key || '').trim().slice(0, 120), chap = String(it.chap || '').trim().slice(0, 120);
     const ex = key ? byKey.get(key) : null;
     if (it.del) { if (ex && !removeIds.has(ex.id)) { removeIds.add(ex.id); removed++; } return; }
+    if (key) seenKeys.add(key);
     const front = String(it.front || '').trim().slice(0, MAX_FIELD), back = String(it.back || '').trim().slice(0, MAX_FIELD);
     if (!front || !back) return;
     if (ex) {
@@ -746,17 +749,24 @@ function mergeItems(deck, items) {
         ex.front = front; ex.back = back; ex.chap = chap;
         Store.touch(deck.id, { bucket: ex.b, meta: true }); updated++;
       }
+      if (src && ex.src !== src) { ex.src = src; Store.touch(deck.id, { bucket: ex.b, meta: true }); }
       return;
     }
     const same = byContent.get(front + '\u0001' + back);
     if (same) {
-      if (key && !same.key) { same.key = key; same.chap = chap; byKey.set(key, same); Store.touch(deck.id, { bucket: same.b, meta: true }); }
+      if (key && !same.key) { same.key = key; same.chap = chap; if (src) same.src = src; byKey.set(key, same); Store.touch(deck.id, { bucket: same.b, meta: true }); }
       else dup++;
       return;
     }
     const c = newCard(front, back, now + i, key, chap);
+    if (src) c.src = src;
     toAdd.push(c); byContent.set(front + '\u0001' + back, c); if (key) byKey.set(key, c);
   });
+  // Fichier du dépôt = contenu complet : une carte venue de ce fichier et
+  // absente de la nouvelle version est retirée.
+  if (opt.prune && src) {
+    for (const c of deck.cards) if (c.src === src && c.key && !seenKeys.has(c.key) && !removeIds.has(c.id)) { removeIds.add(c.id); removed++; }
+  }
   if (removeIds.size) {
     const bs = new Set();
     deck.cards = deck.cards.filter(c => { if (removeIds.has(c.id)) { bs.add(c.b); return false; } return true; });
@@ -783,6 +793,28 @@ function applyBatch(body) {
   Store.touch(d.id, { meta: true, soon: true });
   refreshAfterExternal(d);
   toast(`${d.name} : ${mergeSummary(r)}`);
+}
+// Version hébergée (GitHub Pages…) : les paquets listés dans cartes/index.json
+// sont lus à chaque ouverture et fusionnés, progression conservée.
+async function syncRepoDecks() {
+  if (!/^https?:$/.test(location.protocol)) return;
+  const get = async path => { const r = await fetch(path, { cache: 'no-cache' }); if (!r.ok) throw new Error(r.status); return r.json(); };
+  let list;
+  try { list = await get('cartes/index.json'); } catch { return; }
+  const files = Array.isArray(list) ? list : (list && Array.isArray(list.paquets) ? list.paquets : []);
+  for (const f of files) {
+    const file = String(f || '').trim();
+    if (!/^[\w .-]+\.json$/.test(file)) continue;
+    let body;
+    try { body = await get('cartes/' + encodeURIComponent(file)); } catch { toast(`Fichier cartes/${file} introuvable ou illisible`); continue; }
+    if (!body || !Array.isArray(body.items)) continue;
+    const name = String(body.deck || file.replace(/\.json$/, '')).trim().slice(0, 80);
+    let d = App.decks.find(x => x.src === file) || App.decks.find(x => !x.src && norm(x.name.trim()) === norm(name));
+    if (!d) d = createDeck(name, PALETTE.some(p => p.c === body.color) ? body.color : undefined);
+    if (d.src !== file) { d.src = file; Store.touch(d.id, { meta: true }); }
+    const r = mergeItems(d, body.items, { src: file, prune: true });
+    if (r.added || r.updated || r.removed) { Store.touch(d.id, { meta: true, soon: true }); refreshAfterExternal(d); toast(`${d.name} : ${mergeSummary(r)}`); }
+  }
 }
 function refreshAfterExternal(d) {
   if (App.view === 'home') renderHome();
@@ -1445,6 +1477,7 @@ async function boot() {
   setStatus(mode === 'memory' ? 'memory' : 'saved');
   go('home');
   Store.watchInbox(applyBatch);
+  if (mode !== 'db') syncRepoDecks();
 }
 boot();
 })();
