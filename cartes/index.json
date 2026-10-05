@@ -1,4 +1,6 @@
 [
   "reseaux.json",
-  "anglais-ielts.json"
+  "anglais-ielts.json",
+  "vhdl.json",
+  "c-unix.json"
 ]

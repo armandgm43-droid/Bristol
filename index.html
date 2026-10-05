@@ -643,14 +643,17 @@ const Store = (() => {
 
 /* ---------- Mise en forme des cartes ---------- */
 function renderRich(src) {
-  const maths = [];
+  // Le code entre `…` est mis de côté en premier : ni formule ni mise en forme
+  // n'y est interprétée (pointeurs *p, variables $@ de Makefile…).
+  const codes = [], maths = [];
   let s = String(src ?? '');
+  s = s.replace(/`([^`\n]+)`/g, (m, c) => { codes.push(c); return '\u0001' + (codes.length - 1) + '\u0001'; });
   s = s.replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|\$([^$\n]+?)\$/g, m => { maths.push(m); return '\u0000' + (maths.length - 1) + '\u0000'; });
   s = esc(s)
-    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*\n](?:[\s\S]*?[^*\n])?)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
-    .replace(/\u0000(\d+)\u0000/g, (m, i) => esc(maths[+i]));
+    .replace(/\u0000(\d+)\u0000/g, (m, i) => esc(maths[+i]))
+    .replace(/\u0001(\d+)\u0001/g, (m, i) => '<code>' + esc(codes[+i]) + '</code>');
   return { html: s, math: maths.length > 0 };
 }
 const hasRich = s => /[$*`]|\\\(|\\\[/.test(s);
